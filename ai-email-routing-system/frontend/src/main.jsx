@@ -20,7 +20,7 @@ function App() {
   const [routeLog, setRouteLog] = useState(null)
   const [settings, setSettings] = useState(null)
   const [notice, setNotice] = useState('')
-  const tr = t[lang]
+  const tr = t[lang] || t['en']
   const dir = lang === 'ar' ? 'rtl' : 'ltr'
 
   useEffect(() => { document.documentElement.classList.toggle('dark', dark); localStorage.dark = dark }, [dark])
