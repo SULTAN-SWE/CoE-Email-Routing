@@ -1,0 +1,4 @@
+.env
+data/*.json
+data/messages/*.eml
+__pycache__/
