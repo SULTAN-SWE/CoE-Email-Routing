@@ -54,9 +54,9 @@ class Settings(BaseModel):
     smtp_port: int = Field(default_factory=lambda: int(os.getenv("SMTP_PORT", "587")))
     smtp_user: str = Field(default_factory=lambda: os.getenv("SMTP_USER", ""))
     smtp_password: str = Field(default_factory=lambda: os.getenv("SMTP_PASSWORD", ""))
-    from_email: str = Field(default_factory=lambda: os.getenv("FROM_EMAIL", os.getenv("IMAP_USER", "")))
+    from_email: str = Field(default_factory=lambda: os.getenv("FROM_EMAIL", "") or os.getenv("IMAP_USER", ""))
     ollama_url: str = Field(default_factory=lambda: os.getenv("OLLAMA_URL", "http://localhost:11434"))
-    ollama_model: str = Field(default_factory=lambda: os.getenv("OLLAMA_MODEL", "qwen2.5"))
+    ollama_model: str = Field(default_factory=lambda: os.getenv("OLLAMA_MODEL", "qwen2.5:1.5b"))
     check_interval: int = Field(default_factory=lambda: int(os.getenv("CHECK_INTERVAL_SECONDS", "300")), ge=30)
     targets: dict[str, str] = DEFAULT_TARGETS.copy()
 
@@ -99,38 +99,84 @@ def clean_text(msg: Message) -> str:
     if not parts and msg.get_content_type() == "text/html":
         raw = msg.get_payload(decode=True) or b""
         parts.append(re.sub(r"<[^>]+>", " ", raw.decode(errors="replace")))
-    return "\n".join(parts).strip()[:20000]
+    return "\n".join(parts).strip()[:1500] # تقليل النص للسرعة القصوى
 
 def classify(subject: str, body: str, settings: Settings) -> str:
     prompt = f"Subject: {subject}\n\nBody:\n{body}"
-    response = requests.post(f"{settings.ollama_url.rstrip('/')}/api/generate", json={"model": settings.ollama_model, "system": SYSTEM_PROMPT, "prompt": prompt, "stream": False, "options": {"temperature": 0}}, timeout=120)
+
+    print("\n========== OLLAMA ==========")
+    print("Model:", settings.ollama_model)
+    print("URL:", settings.ollama_url)
+    print("Subject:", subject)
+
+    response = requests.post(
+        f"{settings.ollama_url.rstrip('/')}/api/generate",
+        json={
+            "model": settings.ollama_model,
+            "system": SYSTEM_PROMPT,
+            "prompt": prompt,
+            "stream": False,
+            "options": {
+                "temperature": 0,
+                "num_predict": 20
+            }
+        },
+        timeout=30
+    )
+
+    print("HTTP:", response.status_code)
+    print("RAW RESPONSE:")
+    print(response.text)
+
     response.raise_for_status()
+
     answer = response.json().get("response", "").strip().strip('"').strip()
+
+    print("CLASSIFIED AS:", answer)
+    print("============================\n")
+
     for department in DEPARTMENTS:
-        if answer == department or answer.lower() == department.lower():
+        if answer.lower() == department.lower():
             return department
-    logger.warning("Unknown Ollama answer %r; using IT fallback", answer)
+
+    print("Unknown department, fallback -> IT Department")
     return "IT Department"
 
 def forward_message(raw: bytes, department: str, settings: Settings) -> None:
     if department not in DEPARTMENTS:
         raise ValueError("Invalid department")
-    original = BytesParser(policy=policy.SMTP).parsebytes(raw)
-    forwarded = copy.deepcopy(original)
-    for header in ("To", "Cc", "Bcc", "Resent-To", "Resent-Cc"):
-        if header in forwarded: del forwarded[header]
-    forwarded["To"] = settings.targets.get(department, DEFAULT_TARGETS[department])
-    forwarded["From"] = settings.from_email
-    forwarded["X-AI-Routed-Department"] = department
-    forwarded["X-AI-Router"] = "local-ollama"
+    original = BytesParser(policy=policy.default).parsebytes(raw)
+
+    msg = EmailMessage()
+
+    msg["From"] = settings.from_email
+    msg["To"] = settings.targets[department]
+    msg["Subject"] = f"[AI Routed - {department}] {original.get('Subject','')}"
+
+    body = clean_text(original)
+
+    msg.set_content(
+        f"""This email was automatically routed.
+
+Original Sender:
+{original.get('From')}
+
+Department:
+{department}
+
+-------------------------
+
+{body}
+"""
+    )
+
     with smtplib.SMTP(settings.smtp_host, settings.smtp_port, timeout=30) as smtp:
         smtp.ehlo()
-        if settings.smtp_port != 25:
-            smtp.starttls()
-            smtp.ehlo()
-        if settings.smtp_user:
-            smtp.login(settings.smtp_user, settings.smtp_password)
-        smtp.send_message(forwarded, from_addr=settings.from_email, to_addrs=[settings.targets.get(department, DEFAULT_TARGETS[department])])
+        smtp.starttls()
+        smtp.ehlo()
+        smtp.login(settings.smtp_user, settings.smtp_password)
+        smtp.send_message(msg)
+
 
 def make_log(raw: bytes, department: Optional[str], status: str, error: Optional[str] = None, uid: Optional[str] = None) -> dict[str, Any]:
     msg = BytesParser(policy=policy.default).parsebytes(raw)
@@ -138,6 +184,7 @@ def make_log(raw: bytes, department: Optional[str], status: str, error: Optional
     (MAIL_DIR / f"{item['id']}.eml").write_bytes(raw)
     return item
 
+# ✅ يقرأ كل الإيميلات غير المقروءة بدون أي حدود
 def process_unread() -> int:
     settings = get_settings()
     required = [settings.imap_host, settings.imap_user, settings.imap_password, settings.smtp_host]
@@ -150,22 +197,58 @@ def process_unread() -> int:
         mailbox = imaplib.IMAP4_SSL(settings.imap_host, settings.imap_port)
         mailbox.login(settings.imap_user, settings.imap_password)
         mailbox.select("INBOX")
-        typ, data = mailbox.search(None, "UNSEEN")
-        for num in data[0].split():
-            typ, fetched = mailbox.fetch(num, "(RFC822)")
-            raw = next((part[1] for part in fetched if isinstance(part, tuple)), None)
-            if not raw: continue
-            item = make_log(raw, None, "Failed")
+        
+        typ, data = mailbox.search(None, '(UNSEEN)')
+        print("IMAP SEARCH:", typ, data)
+        logger.info(f"Found {len(data[0].split()) if data[0] else 0} unread emails")
+        unread_list = data[0].split() if data[0] else []
+        
+        for num in unread_list:
+            item = None
             try:
+                typ, fetched = mailbox.fetch(num, "(RFC822)")
+                raw = next((part[1] for part in fetched if isinstance(part, tuple)), None)
+                if not raw: continue
+                
+                item = make_log(raw, None, "Pending")
+
                 parsed = BytesParser(policy=policy.default).parsebytes(raw)
-                department = classify(parsed.get("Subject", ""), clean_text(parsed), settings)
+
+                print("=" * 60)
+                print("Processing:", parsed.get("Subject", "(No Subject)"))
+                print("From:", parsed.get("From"))
+
+                department = classify(
+                parsed.get("Subject", ""),
+                clean_text(parsed),
+                settings,
+                        )
+
+                print("Department:", department)
+
                 forward_message(raw, department, settings)
-                item.update(department=department, status="Forwarded", error=None)
+
+                item.update(
+                department=department,
+                status="Forwarded",
+                error=None,
+                )
+
+                logs = get_logs()
+                logs.append(item)
+                save_logs(logs)
+
+                mailbox.store(num, "+FLAGS", "\\Seen")
+
+                print("Forwarded Successfully")
+                print("=" * 60)
             except Exception as exc:
                 logger.exception("Could not route message")
-                item["error"] = str(exc)
-            logs = get_logs(); logs.append(item); save_logs(logs)
-            mailbox.store(num, "+FLAGS", "\\Seen")
+                if item:
+                    item["error"] = str(exc)
+                    logs = get_logs(); logs.append(item); save_logs(logs)
+            finally:
+                pass
             count += 1
     except Exception:
         logger.exception("IMAP polling failed")
@@ -188,8 +271,6 @@ async def lifespan(app: FastAPI):
     stop_event.set(); await asyncio.wait_for(task, timeout=10)
 
 app = FastAPI(title="AI Email Routing System", lifespan=lifespan)
-# The dashboard is intentionally an internal, unauthenticated tool. Restrict access at
-# the network/firewall level when deploying beyond localhost.
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
 
 @app.get("/api/health")
